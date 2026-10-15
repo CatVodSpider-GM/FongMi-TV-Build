@@ -83,7 +83,10 @@ jobs:
           echo "local.properties 已生成"
 
       - name: Build release APKs
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: |
+          # 上游把 gradlew 提交成了 100644（Windows 上 ls -l 会假显示 755），Linux 上直接跑会 exit 126
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       # AbiApkPackaging 会在 assemble<Flavor>Release 的 doLast 里把产物汇总到 rootProject/Release/apk
       - name: List built APKs
