@@ -1,0 +1,135 @@
+name: Build FongMi TV APK
+
+# 本仓库只承载 CI：源码不落库，运行时从上游 FongMi/TV 拉取再编译，
+# 产物是 4 个签名 APK（leanback / mobile 两个 flavor × arm64-v8a / armeabi-v7a）。
+# 签名相关 secret 见 README.md；没配也能跑，只是会退化成一次性随机 keystore。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'FongMi/TV 的 ref（分支 / tag / commit SHA）'
+        required: false
+        default: 'fongmi'
+        type: string
+      tag:
+        description: 'Release tag，留空则用 v<当天日期>'
+        required: false
+        default: ''
+        type: string
+  # 想跟着上游自动出包就打开下面这段（每天 22:37 UTC，避开整点）
+  # schedule:
+  #   - cron: '37 22 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout FongMi/TV
+        uses: actions/checkout@v7
+        with:
+          repository: FongMi/TV
+          ref: ${{ inputs.ref || 'fongmi' }}
+          fetch-depth: 1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # compileSdk 37 不一定预装；这个 action 装好 cmdline-tools 并接受 license，
+      # 之后 AGP 才能自动把缺的 platform / build-tools 拉下来。
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # app/build.gradle 在 configuration 阶段就 rootProject.file('local.properties')
+      # 后直接 withInputStream —— 文件不存在会当场抛异常，所以这步必须先跑。
+      - name: Prepare signing config
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            ALIAS="${KEY_ALIAS:?KEYSTORE_BASE64 已配置时必须同时配置 KEY_ALIAS}"
+            PASS="${KEYSTORE_PASSWORD:?KEYSTORE_BASE64 已配置时必须同时配置 KEYSTORE_PASSWORD}"
+            echo "使用 secrets 中的 keystore 签名"
+          else
+            ALIAS="fongmi"
+            PASS="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$KS" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=FongMi TV CI, O=FongMi-TV-Build, C=CN"
+            echo "::warning::未配置 KEYSTORE_BASE64，本次使用临时 keystore；签名每次构建都不同，无法覆盖安装此前版本"
+          fi
+          printf 'sdk.dir=%s\nstoreFile=%s\nkeyAlias=%s\nstorePassword=%s\n' \
+            "${ANDROID_HOME:?ANDROID_HOME 未设置}" "$KS" "$ALIAS" "$PASS" > local.properties
+          echo "local.properties 已生成"
+
+      - name: Build release APKs
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # AbiApkPackaging 会在 assemble<Flavor>Release 的 doLast 里把产物汇总到 rootProject/Release/apk
+      - name: List built APKs
+        run: ls -lh Release/apk/
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: fongmi-tv-apk
+          path: Release/apk/*.apk
+          if-no-files-found: error
+
+      - name: Set release metadata
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          IN_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          TAG="${IN_TAG:-v$(date -u +%Y.%m.%d)}"
+          {
+            echo "REL_TAG=$TAG"
+            echo "REL_NAME=FongMi TV $TAG"
+            echo "REL_REF=${IN_REF:-fongmi}"
+            echo "REL_SHA=$(git rev-parse --short HEAD)"
+          } >> "$GITHUB_ENV"
+
+      # 同名 tag 已存在时 action 会更新那个 release 并覆盖同名 asset，重复跑同一天是安全的
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.REL_TAG }}
+          name: ${{ env.REL_NAME }}
+          files: Release/apk/*.apk
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          body: |
+            上游源码：[FongMi/TV](https://github.com/FongMi/TV) @ `${{ env.REL_REF }}` (commit `${{ env.REL_SHA }}`)
+
+            产物由 `./gradlew assembleRelease` 生成，`leanback` / `mobile` 两个 flavor 各自按 ABI 拆分：
+
+            | 文件 | 适用设备 |
+            | --- | --- |
+            | `leanback-arm64_v8a.apk` | 电视盒子（64 位，绝大多数） |
+            | `leanback-armeabi_v7a.apk` | 电视盒子（32 位老设备） |
+            | `mobile-arm64_v8a.apk` | 手机 / 平板（64 位） |
+            | `mobile-armeabi_v7a.apk` | 手机 / 平板（32 位老设备） |
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
