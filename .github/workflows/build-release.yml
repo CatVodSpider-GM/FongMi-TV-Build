@@ -3,10 +3,18 @@ name: Build FongMi TV APK
 # 本仓库只承载 CI：源码不落库，运行时从上游拉取再编译，
 # 产物是 4 个签名 APK（leanback / mobile 两个 flavor × arm64-v8a / armeabi-v7a）。
 #
-# 为什么要拉三个仓库：FongMi/TV 的 app/libs/lib-*.aar 全部被 .gitignore 排除
+# 为什么要拉两个仓库：FongMi/TV 的 app/libs/lib-*.aar 全部被 .gitignore 排除
 # （上游 README 原话：「配套 AAR 放入 app/libs/，lib-*.aar 未納入 Git，單純 clone 不包含完整播放器依賴」），
-# 那 21 个 AAR 是 FongMi 自己编好的 media3 分支。裸 clone 必然以
+# 那 20 个 AAR 是 FongMi 自己编好的 media3 分支。裸 clone 必然以
 # `package androidx.media3.* does not exist` 编译失败。这里现场把它们编出来。
+#
+# 为什么默认 ref 钉在 fe6a5b23（5.6.1）：从 b9455fb1「Integrate libass and advanced
+# subtitle controls」（2026-08-27）起，TV 开始 import androidx.media3.exoplayer.libass.*、
+# ui.libass.LibassPlayerViewController、exoplayer.text.SecondaryTextOutput、
+# trackselection.SecondaryTextTrackSelector —— 这些类 FongMi/media 从没公开过
+# （release / release-1.11.0-fongmi 两条分支、全 GitHub 30+ fork、全站代码搜索都没有定义）。
+# fe6a5b23 恰好是「media3 需求面 == 那 20 个 AAR」的最后一个 commit。
+# 详见 README「版本上限」一节与 workflow 里的 preflight 守卫。
 #
 # 签名相关 secret 见 README.md；没配也能跑，只是会退化成一次性随机 keystore。
 
@@ -14,19 +22,14 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'FongMi/TV 的 ref（分支 / tag / commit SHA）'
+        description: 'FongMi/TV 的 ref（分支 / tag / commit SHA，默认 5.6.1）'
         required: false
-        default: 'fongmi'
+        default: 'fe6a5b235477c02633cf3bc50d4cd83414a521b4'
         type: string
       media3_ref:
-        description: 'FongMi/media 的 media3 ref（编 20 个 lib-*.aar 用）'
+        description: 'FongMi/media 的 ref（编 20 个 lib-*.aar 用）'
         required: false
         default: '3c2cbe8ac742c2fe15eff52f03eeb3b1b648848d'
-        type: string
-      libass_ref:
-        description: 'FongMi/media 的 libass ref（含 libraries/exoplayer_libass）'
-        required: false
-        default: '9dae39e9689ee305c83f94bd11cf3bcecb9d6171'
         type: string
       tag:
         description: 'Release tag，留空则用 v<当天日期>'
@@ -47,17 +50,32 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # media3 20 个模块 + libass 的 NDK native 编译 + app 的 chaquopy/R8，喂饱它
+    # media3 20 个模块 + app 的 chaquopy/R8，喂饱它
     timeout-minutes: 240
     steps:
       - name: Checkout FongMi/TV
         uses: actions/checkout@v7
         with:
           repository: FongMi/TV
-          ref: ${{ inputs.ref || 'fongmi' }}
+          ref: ${{ inputs.ref || 'fe6a5b235477c02633cf3bc50d4cd83414a521b4' }}
           fetch-depth: 1
 
-      # media3 主分支：编 move.txt 里列的 20 个 lib-*-release.aar。
+      # 先拦一道：libass 那一整套 media3 代码上游从未公开，任何依赖它的 ref 都编不过。
+      # 与其等到 javac 抛 15 条 `package ... does not exist` 再猜，不如在这里秒挂并说清原因。
+      - name: Preflight - TV ref 是否需要未公开的 libass
+        run: |
+          set -euo pipefail
+          if grep -rqE 'androidx\.media3\.(exoplayer|ui)\.libass|SecondaryText(TrackSelector|Output)' app/src; then
+            echo "::error::该 ref 依赖 FongMi 未公开的 media3 代码，公开源无法编译。"
+            echo "自 b9455fb1（2026-08-27, 5.6.2+）起 TV 开始使用："
+            grep -rhoE 'androidx\.media3\.[a-z.]*libass\.[A-Za-z]+|SecondaryText(TrackSelector|Output)' app/src | sort -u | sed 's/^/    /'
+            echo "这些类不在 FongMi/media 的任何公开 ref 里（该仓库最后 push 是 2026-08-14），"
+            echo "也不在任何 fork 上。请改用 fe6a5b23（5.6.1）或更早的 ref。"
+            exit 1
+          fi
+          echo "✅ 该 ref 的 media3 需求面在公开 AAR 覆盖范围内"
+
+      # 编 move.txt 里列的 20 个 lib-*-release.aar。
       # 这个 ref 就是 FongMi/media 分支 release-1.11.0-fongmi 的 tip，即 FongMi 给 TV 配的那份。
       - name: Checkout FongMi/media (media3)
         uses: actions/checkout@v7
@@ -66,18 +84,6 @@ jobs:
           ref: ${{ inputs.media3_ref || '3c2cbe8ac742c2fe15eff52f03eeb3b1b648848d' }}
           path: media3
           fetch-depth: 1
-
-      # libass 在另一条分支上（与上面那个 ref 已 diverged），只能单独 checkout 一份。
-      # 它带 libass-cmake 子模块，子模块又挂 ass/freetype/fontconfig/harfbuzz/fribidi/expat/unibreak，
-      # 所以必须 recursive，否则 prepare_libass.sh 会以「Missing libass-cmake dependency submodule」退出。
-      - name: Checkout FongMi/media (libass)
-        uses: actions/checkout@v7
-        with:
-          repository: FongMi/media
-          ref: ${{ inputs.libass_ref || '9dae39e9689ee305c83f94bd11cf3bcecb9d6171' }}
-          path: media3-ass
-          fetch-depth: 1
-          submodules: recursive
 
       - name: Set up JDK 21
         uses: actions/setup-java@v6
@@ -99,14 +105,12 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      # libass 的 native 部分由 libass-cmake 现编：prepare_libass.sh 会对每个依赖跑
-      # autogen.sh / buildconf.sh，所以 autoconf 那一套必须在。CMake + NDK 同理。
       # android-37.0 还在 preview 频道上，所以要 --channel=3。
-      - name: Install native build tools, CMake and NDK
+      # 不需要 NDK / CMake：TV 没有 externalNativeBuild，各子模块的 jniLibs 是提交好的 .so，
+      # 20 个 media3 AAR 里的 ffmpeg / mpv / mpegh .so 也是预编译产物，Chaquopy 自带 bootstrap。
+      - name: Install Android SDK platform and build-tools
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y autoconf automake autopoint gettext gperf libtool ninja-build pkg-config
 
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_SDK_ROOT/ANDROID_HOME 都没设置}}"
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
@@ -122,8 +126,6 @@ jobs:
             "platforms;android-37.0" \
             "platforms;android-36" \
             "build-tools;37.0.0" \
-            "cmake;3.22.1" \
-            "ndk;29.0.14206865" \
             "platform-tools"
 
           test -f "$SDK_ROOT/platforms/android-37.0/android.jar" || {
@@ -131,11 +133,10 @@ jobs:
             find "$SDK_ROOT/platforms" -maxdepth 2 -name android.jar -print 2>/dev/null || true
             exit 1
           }
-          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
       # 上游把 gradlew 提交成了 100644（Windows 上 ls -l 会假显示 755），Linux 上直接跑会 exit 126
       - name: Make gradle wrappers executable
-        run: chmod +x gradlew media3/gradlew media3-ass/gradlew
+        run: chmod +x gradlew media3/gradlew
 
       # move.txt 是 FongMi 自己用的搬运清单（他本机 move.bat 从 D:\Project\media\libraries 拷到 D:\Project\TV\app\libs），
       # 一共 20 个模块。media3 把 buildDir 改成了 buildout，所以产物在 */buildout/outputs/aar，得用 find 捞。
@@ -175,23 +176,6 @@ jobs:
           }
           echo "== app/libs 里的 media3 AAR =="
           ls -1 app/libs/lib-*.aar
-
-      # libass 不在 media3 主分支上，走单独那份检出；native 由 prepare_libass.sh 现编（两套 ABI）。
-      - name: Build libass AAR into app/libs
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000"
-        run: |
-          set -euo pipefail
-          bash media3-ass/libraries/exoplayer_libass/src/main/jni/prepare_libass.sh
-          ./media3-ass/gradlew -p media3-ass :lib-exoplayer-libass:assembleRelease --stacktrace --no-daemon
-
-          SRC="$(find media3-ass -type f -path '*/outputs/aar/lib-exoplayer-libass-release.aar' -print -quit)"
-          if [ -z "$SRC" ]; then
-            echo "::error::没编出 lib-exoplayer-libass-release.aar"
-            exit 1
-          fi
-          cp "$SRC" app/libs/lib-exoplayer-libass-release.aar
-          ls -lh app/libs/lib-exoplayer-libass-release.aar
 
       # app/build.gradle 在 configuration 阶段就 rootProject.file('local.properties')
       # 后直接 withInputStream —— 文件不存在会当场抛异常，所以这步必须先跑。
@@ -244,10 +228,14 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${IN_TAG:-v$(date -u +%Y.%m.%d)}"
+          VER="$(sed -n 's/.*versionName "\([^"]*\)".*/\1/p' app/build.gradle | head -n 1)"
+          CODE="$(sed -n 's/.*versionCode \([0-9]*\).*/\1/p' app/build.gradle | head -n 1)"
           {
             echo "REL_TAG=$TAG"
             echo "REL_NAME=FongMi TV $TAG"
-            echo "REL_REF=${IN_REF:-fongmi}"
+            echo "REL_VERSION=$VER"
+            echo "REL_VERSION_CODE=$CODE"
+            echo "REL_REF=${IN_REF:-fe6a5b235477c02633cf3bc50d4cd83414a521b4}"
             echo "REL_MEDIA3=${IN_MEDIA3:-3c2cbe8ac742c2fe15eff52f03eeb3b1b648848d}"
             echo "REL_SHA=$(git rev-parse --short HEAD)"
           } >> "$GITHUB_ENV"
@@ -263,10 +251,12 @@ jobs:
           draft: false
           prerelease: false
           body: |
+            版本：**${{ env.REL_VERSION }}**（versionCode ${{ env.REL_VERSION_CODE }}）
+
             上游源码：[FongMi/TV](https://github.com/FongMi/TV) @ `${{ env.REL_REF }}` (commit `${{ env.REL_SHA }}`)
 
             播放器依赖由 [FongMi/media](https://github.com/FongMi/media) @ `${{ env.REL_MEDIA3 }}` 现场编成
-            21 个 `lib-*.aar`（上游不发布这些文件），再由 `./gradlew assembleRelease` 生成
+            20 个 `lib-*.aar`（上游不发布这些文件），再由 `./gradlew assembleRelease` 生成
             `leanback` / `mobile` 两个 flavor，各自按 ABI 拆分：
 
             | 文件 | 适用设备 |
@@ -275,5 +265,8 @@ jobs:
             | `leanback-armeabi_v7a.apk` | 电视盒子（32 位老设备） |
             | `mobile-arm64_v8a.apk` | 手机 / 平板（64 位） |
             | `mobile-armeabi_v7a.apk` | 手机 / 平板（32 位老设备） |
+
+            > 这是公开源码能编到的**最高版本**。上游 5.6.2 起依赖了从未公开的 media3 libass
+            > 代码，详见仓库 README「版本上限」。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
