@@ -54,6 +54,15 @@ workflow 每次都会现场生成这个文件。
 | compileSdk / targetSdk | 37 / 37，minSdk 24 |
 | Python | 3.10（chaquopy，`chaquo/requirements.txt` 里的包会现装） |
 
+Chaquopy 有两套 Python：**target** 是打进 APK 的那份（`chaquo/build.gradle` 的 `python { version = "3.10" }`），
+**buildPython** 是构建机上跑 pip 的那份，主次版本必须和 target 一致。runner 自带的是 3.12+，
+所以 workflow 里专门用 `actions/setup-python` 装了 3.10，否则 `installReleasePythonRequirements`
+会以 `Couldn't find Python 3.10` 失败。
+
+另外上游 `FongMi/TV` 把 `gradlew` 提交成了 `100644`（没有可执行位），Linux 上直接 `./gradlew`
+会 `exit 126`；workflow 里先 `chmod +x`。注意在 Windows 上 `ls -l gradlew` 会假显示 `-rwxr-xr-x`，
+要看真实 mode 得用 `git ls-tree`。
+
 `compileSdk 37` 不一定在 runner 预装的 SDK 里，workflow 用 `android-actions/setup-android`
 装好 cmdline-tools 并接受 license，剩下的 platform / build-tools 交给 AGP 自动下载。
 

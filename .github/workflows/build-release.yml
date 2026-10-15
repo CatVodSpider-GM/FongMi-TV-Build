@@ -46,6 +46,14 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
+      # Chaquopy 的 buildPython 是「构建期」解释器（跟打进 APK 的 target python 是两回事），
+      # 主次版本必须和 chaquo/build.gradle 里的 version = "3.10" 一致；runner 自带的是 3.12+，
+      # 不装会以 "Couldn't find Python 3.10" 失败。装上之后 python3.10 / python3 都指向它。
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
       # compileSdk 37 不一定预装；这个 action 装好 cmdline-tools 并接受 license，
       # 之后 AGP 才能自动把缺的 platform / build-tools 拉下来。
       - name: Set up Android SDK
